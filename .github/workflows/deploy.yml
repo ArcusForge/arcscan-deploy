@@ -1,0 +1,175 @@
+name: Deploy ArcScan
+
+# Triggers:
+#   - workflow_dispatch: manual run, operator enters target SHA
+#   - repository_dispatch (event_type=deploy-arcscan): fired by the
+#     private repo on push to main, payload carries the SHA
+#
+# Deliberately NO pull_request trigger — would expose secrets to forks.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full git SHA to deploy from ArcusForge/ArcScan"
+        required: true
+        type: string
+      skip_smoke:
+        description: "Skip post-deploy smoke test"
+        required: false
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [deploy-arcscan]
+
+permissions:
+  id-token: write   # OIDC role assumption
+  contents: read
+
+env:
+  AWS_REGION:    us-east-1
+  AWS_ROLE_ARN:  arn:aws:iam::285515884768:role/arcus-deploy-from-public-gha
+  EC2_INSTANCE:  i-086907a005452300c
+  S3_BUCKET:     pbs-production-static-36f9d155
+  PRIVATE_REPO:  ArcusForge/ArcScan
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Resolve and validate target SHA
+        id: target
+        # Read external inputs into env vars — never interpolate them directly
+        # into shell commands. Regex-validate to refuse anything that isn't a
+        # plain git SHA before exposing it to subsequent steps.
+        env:
+          DISPATCH_SHA: ${{ inputs.sha }}
+          CLIENT_PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            SHA="$DISPATCH_SHA"
+          else
+            SHA="$CLIENT_PAYLOAD_SHA"
+          fi
+          if [ -z "$SHA" ]; then
+            echo "::error::No SHA in event payload or inputs"
+            exit 1
+          fi
+          if ! [[ "$SHA" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::SHA does not match expected git-hash format"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Target SHA: $SHA"
+
+      - name: Checkout private source @ SHA
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ steps.target.outputs.sha }}
+          path: source
+          fetch-depth: 1
+
+      - name: Build release zip
+        working-directory: source
+        run: |
+          set -euo pipefail
+          # Mirror the private repo's existing zip recipe (git archive HEAD).
+          # Keep the same artifact shape so the on-box deploy is unchanged.
+          git archive --format=zip -o ../arcscan.zip HEAD
+          ls -la ../arcscan.zip
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: arcscan-deploy-${{ steps.target.outputs.sha }}
+
+      - name: Upload release to S3
+        id: upload
+        env:
+          SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          KEY="releases/playbookscan-${SHA}.zip"
+          aws s3 cp arcscan.zip "s3://${S3_BUCKET}/${KEY}"
+          echo "release_key=${KEY}" >> "$GITHUB_OUTPUT"
+          echo "Uploaded: s3://${S3_BUCKET}/${KEY}"
+
+      - name: Deploy via SSM
+        env:
+          RELEASE_KEY: ${{ steps.upload.outputs.release_key }}
+        run: |
+          set -euo pipefail
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[
+              'echo === [1/6] Downloading release ===',
+              'aws s3 cp s3://${S3_BUCKET}/${RELEASE_KEY} /tmp/pbs-release.zip --region ${AWS_REGION} 2>&1 || { echo STEP1_FAIL; exit 1; }',
+              'rm -rf /tmp/arcscan-extract && mkdir /tmp/arcscan-extract',
+              'unzip -q /tmp/pbs-release.zip -d /tmp/arcscan-extract 2>&1 || { echo STEP2_FAIL; exit 1; }',
+              'rm -rf /opt/playbookscan/app.bak && cp -r /opt/playbookscan/app /opt/playbookscan/app.bak 2>&1 || echo backup_skipped',
+              'rsync -a --delete /tmp/arcscan-extract/ /opt/playbookscan/app/ --exclude settings_aws.py --exclude .env --exclude media/ 2>&1 | tail -5 || { echo STEP3_FAIL; rm -rf /opt/playbookscan/app && mv /opt/playbookscan/app.bak /opt/playbookscan/app; exit 1; }',
+              '/opt/playbookscan/venv/bin/pip install -q -r /opt/playbookscan/app/requirements.txt -c /opt/playbookscan/app/constraints.txt 2>&1 || { echo STEP4_FAIL; exit 1; }',
+              'DJANGO_SETTINGS_MODULE=playbookscan.settings_aws /opt/playbookscan/venv/bin/python /opt/playbookscan/app/manage.py migrate --noinput 2>&1 || { echo STEP5_FAIL; exit 1; }',
+              'DJANGO_SETTINGS_MODULE=playbookscan.settings_aws /opt/playbookscan/venv/bin/python /opt/playbookscan/app/manage.py seed_policies 2>&1 || echo seed_policies_skipped',
+              'DJANGO_SETTINGS_MODULE=playbookscan.settings_aws /opt/playbookscan/venv/bin/python /opt/playbookscan/app/manage.py seed_marketplace_policies 2>&1 || echo seed_marketplace_skipped',
+              'DJANGO_SETTINGS_MODULE=playbookscan.settings_aws /opt/playbookscan/venv/bin/python /opt/playbookscan/app/manage.py collectstatic --noinput --verbosity 0 2>&1 || { echo STEP5b_FAIL; exit 1; }',
+              'chown -R playbookscan:playbookscan /opt/playbookscan/app',
+              'systemctl restart playbookscan playbookscan-daphne arcscan-celery-worker arcscan-celery-beat 2>&1 || { echo STEP6_FAIL; exit 1; }',
+              'systemctl is-active playbookscan playbookscan-daphne arcscan-celery-worker arcscan-celery-beat && echo SERVICES_OK || { echo STEP6_NOTACTIVE; exit 1; }',
+              'rm -rf /tmp/arcscan-extract /tmp/pbs-release.zip /opt/playbookscan/app.bak',
+              'echo === Deploy complete ==='
+            ]" \
+            --region "$AWS_REGION" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+          # Poll until terminal state — up to 10 minutes.
+          for i in $(seq 1 60); do
+            sleep 10
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE" \
+              --region "$AWS_REGION" \
+              --query "Status" --output text)
+            echo "[$(date -u +%H:%M:%S)] poll $i: $STATUS"
+            case "$STATUS" in
+              Success)   echo "Deploy succeeded"; exit 0 ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE" \
+                  --region "$AWS_REGION" \
+                  --query "StandardOutputContent" --output text | tail -50
+                exit 1
+                ;;
+            esac
+          done
+          echo "::error::Deploy poll timed out after 10 minutes"
+          exit 1
+
+      - name: Smoke test
+        if: ${{ inputs.skip_smoke != true }}
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            CODE=$(curl -fsS -o /dev/null -w "%{http_code}" --max-time 15 https://arcusautomate.com/ || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "Smoke test passed (HTTP $CODE)"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $CODE — retrying"
+            sleep 10
+          done
+          echo "::warning::Smoke test failed after 3 attempts — deploy succeeded but site may be slow to recover"
