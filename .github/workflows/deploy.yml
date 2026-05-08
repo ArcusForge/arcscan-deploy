@@ -114,7 +114,7 @@ jobs:
               'echo === [1/6] Downloading release ===',
               'aws s3 cp s3://${S3_BUCKET}/${RELEASE_KEY} /tmp/pbs-release.zip --region ${AWS_REGION} 2>&1 || { echo STEP1_FAIL; exit 1; }',
               'rm -rf /tmp/arcscan-extract && mkdir /tmp/arcscan-extract',
-              'unzip -q /tmp/pbs-release.zip -d /tmp/arcscan-extract 2>&1 || { echo STEP2_FAIL; exit 1; }',
+              'unzip -q /tmp/pbs-release.zip -d /tmp/arcscan-extract 2>&1; _ec=$?; [ $_ec -le 1 ] || { echo STEP2_FAIL; exit $_ec; }',
               'rm -rf /opt/playbookscan/app.bak && cp -r /opt/playbookscan/app /opt/playbookscan/app.bak 2>&1 || echo backup_skipped',
               'rsync -a --delete /tmp/arcscan-extract/ /opt/playbookscan/app/ --exclude settings_aws.py --exclude .env --exclude media/ 2>&1 | tail -5 || { echo STEP3_FAIL; rm -rf /opt/playbookscan/app && mv /opt/playbookscan/app.bak /opt/playbookscan/app; exit 1; }',
               '/opt/playbookscan/venv/bin/pip install -q -r /opt/playbookscan/app/requirements.txt -c /opt/playbookscan/app/constraints.txt 2>&1 || { echo STEP4_FAIL; exit 1; }',
