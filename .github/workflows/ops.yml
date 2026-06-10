@@ -12,7 +12,7 @@ on:
         description: "What to do"
         required: true
         type: choice
-        options: [diagnose, rollback]
+        options: [diagnose, rollback, fix-statedir]
 
 permissions:
   id-token: write
@@ -41,7 +41,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "$ACTION" = "diagnose" ]; then
+          if [ "$ACTION" = "fix-statedir" ]; then
+            COMMAND_ID=$(aws ssm send-command \
+              --instance-ids "$EC2_INSTANCE" \
+              --document-name "AWS-RunShellScript" \
+              --parameters "commands=[
+                'echo === DROPINS ===',
+                'cat /etc/systemd/system/playbookscan.service.d/deploy-statedir.conf /etc/systemd/system/playbookscan.service.d/terraform-deploy.conf 2>&1 | head -40',
+                'mkdir -p /var/lib/arcscan-deployments /var/lib/arcscan /var/run/arcscan',
+                'chown -R playbookscan:playbookscan /var/lib/arcscan-deployments 2>/dev/null || true',
+                'systemctl daemon-reload',
+                'systemctl restart playbookscan playbookscan-daphne arcscan-celery-worker arcscan-celery-beat 2>&1 || { echo RESTART_FAIL; exit 1; }',
+                'sleep 15',
+                'systemctl is-active playbookscan playbookscan-daphne arcscan-celery-worker arcscan-celery-beat && echo FIX_OK || { echo STILL_BROKEN; journalctl -u playbookscan -n 25 --no-pager | tail -25; exit 1; }',
+                'curl -s -o /dev/null -w localgunicorn:%{http_code} http://127.0.0.1:8000/ || true'
+              ]" \
+              --region "$AWS_REGION" \
+              --query "Command.CommandId" --output text)
+          elif [ "$ACTION" = "diagnose" ]; then
             COMMAND_ID=$(aws ssm send-command \
               --instance-ids "$EC2_INSTANCE" \
               --document-name "AWS-RunShellScript" \
