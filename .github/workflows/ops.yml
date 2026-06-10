@@ -1,0 +1,102 @@
+name: Ops (diagnose / rollback)
+
+# Emergency operations against the prod box, added 2026-06-10 during the
+# STEP6_NOTACTIVE deploy failure. Mirrors deploy.yml's OIDC + SSM pattern.
+#   diagnose — systemctl status + journals + disk/mem, read-only
+#   rollback — swap /opt/playbookscan/app.bak back into place and restart
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do"
+        required: true
+        type: choice
+        options: [diagnose, rollback]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION:   us-east-1
+  AWS_ROLE_ARN: arn:aws:iam::285515884768:role/arcus-deploy-from-public-gha
+  EC2_INSTANCE: i-086907a005452300c
+
+jobs:
+  ops:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: arcscan-ops-${{ inputs.action }}
+
+      - name: Run ${{ inputs.action }} via SSM
+        env:
+          ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+
+          if [ "$ACTION" = "diagnose" ]; then
+            COMMAND_ID=$(aws ssm send-command \
+              --instance-ids "$EC2_INSTANCE" \
+              --document-name "AWS-RunShellScript" \
+              --parameters "commands=[
+                'echo === UNITS ===',
+                'systemctl --no-pager -l status playbookscan playbookscan-daphne arcscan-celery-worker arcscan-celery-beat 2>&1 | head -120 || true',
+                'echo === JOURNAL playbookscan ===',
+                'journalctl -u playbookscan -n 80 --no-pager 2>&1 | tail -80 || true',
+                'echo === JOURNAL daphne ===',
+                'journalctl -u playbookscan-daphne -n 25 --no-pager 2>&1 | tail -25 || true',
+                'echo === JOURNAL celery-beat ===',
+                'journalctl -u arcscan-celery-beat -n 25 --no-pager 2>&1 | tail -25 || true',
+                'echo === DISK MEM ===',
+                'df -h / | tail -2; free -m | head -2',
+                'echo === APP DIRS ===',
+                'ls -la /opt/playbookscan/ | head -12'
+              ]" \
+              --region "$AWS_REGION" \
+              --query "Command.CommandId" --output text)
+          else
+            COMMAND_ID=$(aws ssm send-command \
+              --instance-ids "$EC2_INSTANCE" \
+              --document-name "AWS-RunShellScript" \
+              --parameters "commands=[
+                'test -d /opt/playbookscan/app.bak || { echo NO_BACKUP; exit 1; }',
+                'rm -rf /opt/playbookscan/app.fail',
+                'mv /opt/playbookscan/app /opt/playbookscan/app.fail',
+                'mv /opt/playbookscan/app.bak /opt/playbookscan/app',
+                'chown -R playbookscan:playbookscan /opt/playbookscan/app',
+                'systemctl restart playbookscan playbookscan-daphne arcscan-celery-worker arcscan-celery-beat 2>&1 || { echo RESTART_FAIL; exit 1; }',
+                'sleep 12',
+                'systemctl is-active playbookscan playbookscan-daphne arcscan-celery-worker arcscan-celery-beat && echo ROLLBACK_OK || { echo STILL_NOTACTIVE; systemctl --no-pager -l status playbookscan | head -40; exit 1; }'
+              ]" \
+              --region "$AWS_REGION" \
+              --query "Command.CommandId" --output text)
+          fi
+
+          echo "SSM Command ID: $COMMAND_ID"
+          STATUS=Pending
+          for i in $(seq 1 48); do
+            sleep 8
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE" \
+              --region "$AWS_REGION" --query "Status" --output text)
+            echo "[$(date -u +%H:%M:%S)] poll $i: $STATUS"
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
+          done
+
+          echo "=================== STDOUT ==================="
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE" \
+            --region "$AWS_REGION" --query "StandardOutputContent" --output text
+          echo "=================== STDERR ==================="
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE" \
+            --region "$AWS_REGION" --query "StandardErrorContent" --output text
+
+          [ "$STATUS" = "Success" ] || exit 1
